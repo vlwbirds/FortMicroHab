@@ -282,7 +282,8 @@ class_f <- focal(
 
 # Dissolve contiguous pixels into polygons; drop tiny slivers
 polys <- as.polygons(class_f, dissolve=TRUE, values=TRUE, na.rm=TRUE)
-polys <- st_as_sf(polys) %>% st_make_valid()
+polys <- st_as_sf(polys) #(optional to ensure correct geometries) %>% st_make_valid()
+polys <- st_buffer(polys, 0)  # much faster than st_make_valid()
 polys <- polys %>%
   mutate(area_m2 = as.numeric(st_area(geometry))) %>%
   filter(area_m2 >= 1000)  # keep polygons ≥ 0.1 ha (adjust)
