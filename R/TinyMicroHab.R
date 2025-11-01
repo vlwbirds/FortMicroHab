@@ -17,7 +17,6 @@ library(glcm)
 library(spsurvey)
 library(terra)   # v1.7+ recommended
 library(stats)
-library(here)
 
 #---------------- 0) Inputs ----------------
 # naip: SpatRaster (one tile, 4 bands)
@@ -260,41 +259,23 @@ terra::writeRaster(class_r, here("output/classified/class_r_INT1U.tif"),
 
 #--------------- Smooth and Polygonize -----------------
 # Optional: small modal filter to de-speckle (3x3)
-terraOptions(todisk = TRUE)  # stream to disk
+terraOptions(todisk = TRUE, tempdir = "D:/terra_tmp", memfrac = 0.6)
 
-# 3x3 modal (majority) filter for integer class raster
-# - removes NAs from the window
-# - returns NA if *all* neighbors are NA
-# 0) Define the modal filter safely (returns a single integer)
-modal3 <- function(x, ...) {
-  x <- x[!is.na(x)]
-  if (!length(x)) return(NA_integer_)
-  as.integer(terra::modal(x, ties = "random"))
-}
+out_focal <- here::here("output/classified/class_r_modal3_INT1U.tif")
 
-# 1) Make sure class_r is a single-layer integer raster
+# Ensure single-layer integer-like input
 stopifnot(nlyr(class_r) == 1)
 class_r <- as.int(round(class_r))
 
-# 2) (Optional) write your input ONCE (different from output file)
-terra::writeRaster(
-  class_r,
-  here::here("output/classified/class_r_INT1U.tif"),
-  datatype = "INT1U",
-  overwrite = TRUE
-)
-
-# 3) Write focal result to a DIFFERENT filename
-out_focal <- here::here("output/classified/class_r_modal3_INT1U.tif")
-
-class_f <- terra::focal(
-  class_r,
-  w = matrix(1, 3, 3),
-  fun = modal3,
-  pad = TRUE, padValue = NA,
+class_f <- focal(
+  x  = class_r,
+  w  = 3,                 # same as matrix(1,3,3)
+  fun = "modal",          # <-- built-in; avoids the “test failed” path
+  na.rm = TRUE,
+  pad   = TRUE, padValue = NA,
   filename = out_focal,
   datatype = "INT1U",
-  wopt = list(gdal = c("TILED=YES", "COMPRESS=LZW", "BIGTIFF=YES")),
+  wopt = list(gdal = c("TILED=YES","COMPRESS=LZW","BIGTIFF=YES")),
   overwrite = TRUE
 )
 
@@ -305,3 +286,4 @@ polys <- st_as_sf(polys) %>% st_make_valid()
 polys <- polys %>%
   mutate(area_m2 = as.numeric(st_area(geometry))) %>%
   filter(area_m2 >= 1000)  # keep polygons ≥ 0.1 ha (adjust)
+plot(polys)
