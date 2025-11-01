@@ -17,7 +17,6 @@ library(glcm)
 library(spsurvey)
 library(terra)   # v1.7+ recommended
 library(stats)
-library(mapview)
 library(here)
 
 #---------------- 0) Inputs ----------------
@@ -143,16 +142,21 @@ names(ndvi_sd) <- "NDVI_sd"
 
 #---------------- 2.2) Topographic Derivatives ---------------
 slope  <- terrain(dem_small, v = "slope",  unit = "degrees")
-
 aspect <- terrain(dem_small, v = "aspect", unit = "radians")
-aspect <- rast(aspect)  # ensures a clean SpatRaster object
-aspect <- resample(aspect, dem_small, method = "near")  # snap back to DEM grid
-asp_sin <- sin(aspect)
-asp_cos <- cos(aspect)
 
-# Force grid alignment and extent identical to DEM
-asp_sin <- resample(asp_sin, dem_small, method = "near")
-asp_cos <- resample(asp_cos, dem_small, method = "near")
+# Aspect is undefined where slope ~ 0; use a tiny threshold to catch numerics
+thresh <- 0.5  # degrees; tweak (0.1–1.0) after you check slope stats
+
+asp_sin <- ifel( is.na(slope) | is.na(aspect) | slope < thresh,
+                 0, sin(aspect) )
+asp_cos <- ifel( is.na(slope) | is.na(aspect) | slope < thresh,
+                 0, cos(aspect) )
+
+# --- 4) Snap to your template AFTERWARDS ----------------------------------
+templ   <- naip4[[1]]
+slope   <- resample(slope,   templ, method = "bilinear")
+asp_sin <- resample(asp_sin, templ, method = "bilinear")
+asp_cos <- resample(asp_cos, templ, method = "bilinear")
 
 names(asp_sin) <- "asp_sin"
 names(asp_cos) <- "asp_cos"
@@ -207,7 +211,7 @@ assign_cluster <- function(v, centers, mu, sd) {
 stopifnot(nlyr(preds) == ncol(km_centers))
 
 # Run prediction chunk-wise; write to disk to avoid RAM spikes
-out_tif <- "naip_kmeans6_class.tif"
+out_tif <- here("output/naip_dem_kmeans6_class.tif")
 class_r <- app(
   preds,
   fun = assign_cluster,
@@ -224,9 +228,9 @@ names(class_r) <- "class_id"
 
 #---------------- 7) Optional: quicklook PNG & a basic palette ----------------
 pal <- c("#1f78b4","#33a02c","#e31a1c","#ff7f00","#6a3d9a","#b15928")
-png("naip_kmeans6_quicklook.png", width = 1400, height = 1200, res = 150)
+png(here("figs/naip_dem_kmeans6_quicklook.png"), width = 1400, height = 1200, res = 150)
 par(mfrow = c(1, 2))
-plot(class_r, col = pal, main = "NAIP k-means (k=6)")
+plot(class_r, col = pal, main = "NAIP/DEM k-means (k=6)")
 plotRGB(naip_small, 1,2,3, stretch="lin")
 dev.off()
 
@@ -235,7 +239,8 @@ dev.off()
 pal <- rainbow(6)   # or whatever palette you're using
 
 # Save as PNG
-png(here("figs/naip_kmeans6_comparison.png"), width = 2000, height = 1000, res = 150)
+png(here("figs/naip_dem_kmeans6_comparison.png"), width = 2000, height = 1000, res = 150)
+
 par(mfrow = c(1, 2))
 
 # Left: classified raster
@@ -248,3 +253,55 @@ dev.off()  # close the PNG device to finalize the file
 
 
 class_r
+class_r <- round(class_r)
+terra::writeRaster(class_r, here("output/classified/class_r_INT1U.tif"),
+                   datatype = "INT1U",
+                   overwrite = TRUE)
+
+#--------------- Smooth and Polygonize -----------------
+# Optional: small modal filter to de-speckle (3x3)
+terraOptions(todisk = TRUE)  # stream to disk
+
+# 3x3 modal (majority) filter for integer class raster
+# - removes NAs from the window
+# - returns NA if *all* neighbors are NA
+# 0) Define the modal filter safely (returns a single integer)
+modal3 <- function(x, ...) {
+  x <- x[!is.na(x)]
+  if (!length(x)) return(NA_integer_)
+  as.integer(terra::modal(x, ties = "random"))
+}
+
+# 1) Make sure class_r is a single-layer integer raster
+stopifnot(nlyr(class_r) == 1)
+class_r <- as.int(round(class_r))
+
+# 2) (Optional) write your input ONCE (different from output file)
+terra::writeRaster(
+  class_r,
+  here::here("output/classified/class_r_INT1U.tif"),
+  datatype = "INT1U",
+  overwrite = TRUE
+)
+
+# 3) Write focal result to a DIFFERENT filename
+out_focal <- here::here("output/classified/class_r_modal3_INT1U.tif")
+
+class_f <- terra::focal(
+  class_r,
+  w = matrix(1, 3, 3),
+  fun = modal3,
+  pad = TRUE, padValue = NA,
+  filename = out_focal,
+  datatype = "INT1U",
+  wopt = list(gdal = c("TILED=YES", "COMPRESS=LZW", "BIGTIFF=YES")),
+  overwrite = TRUE
+)
+
+
+# Dissolve contiguous pixels into polygons; drop tiny slivers
+polys <- as.polygons(class_f, dissolve=TRUE, values=TRUE, na.rm=TRUE)
+polys <- st_as_sf(polys) %>% st_make_valid()
+polys <- polys %>%
+  mutate(area_m2 = as.numeric(st_area(geometry))) %>%
+  filter(area_m2 >= 1000)  # keep polygons ≥ 0.1 ha (adjust)
