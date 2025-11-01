@@ -1,0 +1,26 @@
+[
+    {
+        "type": "readers.ept",
+        "filename": "https://s3-us-west-2.amazonaws.com/usgs-lidar-public/AZ_CochiseCounty_3_2020/ept.json",
+        "threads": 4,
+        "bounds": "auto"
+    },
+    {
+        "type": "filters.crop",
+        "polygon": "FILE:data/fort_aoi_26912.geojson"
+    },
+    {
+        "type": "filters.splitter",
+        "length": 1000,
+        "buffer": 0,
+        "origin_x": 550000,
+        "origin_y": 3465000
+    },
+    {
+        "type": "writers.las",
+        "filename": "output/tiles/tile_#.laz",
+        "compression": "laszip",
+        "forward": "all"
+    }
+]
+

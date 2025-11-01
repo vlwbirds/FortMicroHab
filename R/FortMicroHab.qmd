@@ -1,0 +1,475 @@
+---
+title: "FH_MicroHab"
+format: html
+editor: visual
+---
+
+# Fort Huachuca Micro-habitat Model
+
+### 0) Libraries
+
+```{r}
+# Working Directory
+library(here)
+# Spatial core
+library(terra)        # rasters & vectors
+library(sf)           # vectors / I/O
+# Data
+library(dplyr)
+# Download & pre-process Sentinel-2 (10 m)
+library(sen2r)        # easiest way to get cloud-masked S2 L2A
+# Modeling
+library(ranger)       # fast random forest
+# Optional: texture features
+# install.packages("glcm")
+library(glcm)
+# Stratified survey design (GRTS)
+library(spsurvey)
+
+```
+
+### 1) Imagery Download
+
+#### A) Sentinel2 Data
+
+```{r}
+# AOI as sf polygon (replace with your study boundary)
+aoi <- st_read(here("data/FH_Boundary.shp")) %>% st_transform(4326)
+
+out_dir <- "data/sentinel2"
+dir.create(out_dir, showWarnings = FALSE)
+
+s2prod <- c("BOA", "SCL")  # bottom-of-atmosphere reflectance + Scene Classification Layer
+
+safe_list <- sen2r(
+  gui = FALSE,
+  extent = aoi,
+  timewindow = as.Date(c("2025-06-01","2025-08-31")),
+  step_atmcorr = "l2a",
+  list_prods = s2prod,
+  mask_type = "cloud_and_shadow",
+  max_cloud_safe = 20,
+  processing_order = "by_groups",
+  path_out = out_dir,
+  path_l2a = file.path(out_dir, "SAFE"),  # 👈 tell sen2r where to put the SAFE files
+  overwrite = TRUE
+)
+
+library(terra)
+naip <- rast("path/to/naip_1m.tif")
+plotRGB(naip, r=1, g=2, b=3, stretch="lin")
+
+```
+
+#### B) NAIP Data 30cm
+
+```{r}
+library(sf)
+library(terra)
+library(rstac)
+library(purrr)
+library(curl)
+
+# --- Inputs ---------------------------------------------------------------
+aoi     <- st_read(here::here("data/FH_Boundary.shp")) |> st_transform(4326)
+aoi_buf <- st_buffer(aoi, dist = 500)                      # include edge tiles
+bb      <- st_bbox(aoi_buf)
+outdir  <- here::here("data/naip_tiles_2023")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# --- 1) Query STAC, fetch ALL pages (unsigned for now) -------------------
+pc <- stac("https://planetarycomputer.microsoft.com/api/stac/v1")
+items <- pc |>
+  stac_search(collections = "naip",
+              bbox = as.numeric(bb),
+              datetime = "2023-01-01/2023-12-31",
+              limit = 200) |>
+  get_request() |>
+  items_fetch()
+
+# --- 2) Find which features intersect the AOI (we'll still download full tiles)
+it_sf <- items_as_sf(items) |> st_make_valid()
+hit   <- st_intersects(it_sf, st_union(aoi), sparse = FALSE)[,1]
+sel   <- which(hit)
+cat("Tiles intersecting AOI:", length(sel), "\n")
+
+# --- Helpers --------------------------------------------------------------
+safe_name <- function(feature, fallback_idx) {
+  id <- feature$id
+  if (is.null(id) || is.na(id)) id <- paste0("tile_", fallback_idx)
+  id <- gsub("[^A-Za-z0-9_\\-]+", "_", id)
+  paste0(id, ".tif")
+}
+
+pick_asset_href <- function(feature) {
+  # Prefer a TIFF asset with role "data"
+  a <- feature$assets
+  if (is.null(a) || !length(a)) return(NULL)
+  nm <- names(a)
+  meta <- lapply(nm, function(k) {
+    list(key   = k,
+         href  = a[[k]]$href %||% NA_character_,
+         type  = a[[k]]$type %||% NA_character_,
+         roles = paste(a[[k]]$roles %||% character(), collapse = ","))
+  })
+  meta <- do.call(rbind, lapply(meta, as.data.frame, stringsAsFactors = FALSE))
+
+  is_tif  <- grepl("image/tiff", meta$type, ignore.case = TRUE) |
+             grepl("\\.tif(f)?($|\\?)", meta$href, ignore.case = TRUE)
+  has_data <- grepl("data", meta$roles, ignore.case = TRUE)
+
+  idx <- which(is_tif & has_data)
+  if (!length(idx)) idx <- which(is_tif)
+  if (!length(idx)) return(NULL)
+  meta$href[idx[1]]
+}
+
+download_one_signed <- function(items_obj, idx, outdir, min_ok = 5e6, tries = 3) {
+  # Rewrap a single feature as an items object and sign it fresh
+  one <- items_obj
+  one$features <- list(items_obj$features[[idx]])
+  one <- items_sign_planetary_computer(one)
+
+  ftr  <- one$features[[1]]
+  href <- pick_asset_href(ftr)
+  if (is.null(href)) {
+    warning(sprintf("No TIFF asset for feature %d; skipping.", idx))
+    return(NULL)
+  }
+  fn <- file.path(outdir, safe_name(ftr, idx))
+
+  # Skip if already good
+  if (file.exists(fn) && file.info(fn)$size > min_ok) return(fn)
+
+  for (t in seq_len(tries)) {
+   ok <- tryCatch({
+  h <- curl::new_handle(
+    low_speed_limit = 10000,      # 10 KB/s
+    low_speed_time  = 60          # for at least 1 min
+  )
+  curl_download(url = href, destfile = fn, mode = "wb", quiet = FALSE, handle = h)
+  TRUE
+}, error = function(e) FALSE)
+
+    if (ok && file.exists(fn) && file.info(fn)$size > min_ok) return(fn)
+
+    # Re-sign before retry in case SAS token expired
+    one <- items_sign_planetary_computer(one)
+    ftr  <- one$features[[1]]
+    href <- pick_asset_href(ftr)
+    Sys.sleep(1)
+  }
+  warning(sprintf("Failed or tiny file for %s", basename(fn)))
+  NULL
+}
+
+# --- 3) Iterate with a simple progress bar -------------------------------
+paths <- vector("list", length(sel))
+pb <- txtProgressBar(min = 0, max = length(sel), style = 3)
+for (j in seq_along(sel)) {
+  i <- sel[j]
+  paths[[j]] <- download_one_signed(items, i, outdir)
+  setTxtProgressBar(pb, j)
+}
+close(pb)
+
+tif_paths <- Filter(Negate(is.null), paths)
+cat("\nSaved tiles:", length(tif_paths), "\n")
+print(basename(unlist(tif_paths)))
+
+# --- 4) (Optional) Mosaic later; clip to AOI when ready ------------------
+# rlist <- lapply(tif_paths, \(p) tryCatch(rast(p), error = \(e) NULL)) |> purrr::compact()
+# full_mosaic <- do.call(mosaic, rlist)
+# writeRaster(full_mosaic, here::here("output/naip_2023_full_mosaic.tif"), overwrite = TRUE)
+# naip_clip <- crop(full_mosaic, vect(aoi)) |> mask(vect(aoi))
+# writeRaster(naip_clip, here::here("output/naip_2023_clip.tif"), overwrite = TRUE)
+
+```
+
+### 2) Build a predictor stack
+
+#### A) Sentinel2 (10m)
+
+Compute key indices and (optionally) texture; keep layers at the same resolution/projection.
+
+```{r}
+# Read the BOA mosaic (bands: B02,B03,B04,B08 at 10m; add B11,B12 at 20m if you resample)
+boa <- rast(list.files(out_dir, pattern = "BOA_10m.*tif$", recursive=TRUE, full.names=TRUE)) 
+names(boa) <- c("B02","B03","B04","B08")  # blue, green, red, NIR (check order in your files)
+
+# Indices
+ndvi <- (boa$B08 - boa$B04) / (boa$B08 + boa$B04)
+ndwi <- (boa$B03 - boa$B08) / (boa$B03 + boa$B08)     # McFeeters-like
+savi <- ((boa$B08 - boa$B04) / (boa$B08 + boa$B04 + 0.5)) * (1.5)
+
+names(ndvi) <- "NDVI"; names(ndwi) <- "NDWI"; names(savi) <- "SAVI"
+
+# Optional: simple texture on NDVI (window = 3x3 or 5x5; larger = smoother)
+ndvi_tex <- glcm:::glcm_cpp(as.matrix(ndvi, wide=TRUE), 
+                            window=c(5,5), statistics=c("mean","contrast","entropy"))
+# Convert back to SpatRaster
+ndvi_tex_r <- rast(ndvi); values(ndvi_tex_r) <- ndvi_tex[,"mean"]; names(ndvi_tex_r) <- "NDVI_tex"
+
+# Predictor stack
+preds <- c(boa, ndvi, ndwi, savi, ndvi_tex_r)
+preds <- mask(preds, vect(aoi))  # clip to AOI
+
+```
+
+#### B) NAIP (30cm)
+
+```{r}
+library(terra)
+library(sf)
+library(dplyr)
+
+#--- Inputs you already have ---------------------------------------------------
+# AOI polygon (WGS84)
+aoi <- st_read(here::here("data/FH_Boundary.shp")) |> st_transform(4326)
+
+# Either: a single NAIP mosaic you wrote earlier...
+# naip <- rast(here::here("output/naip_2023_FH_clip.tif"))
+
+# ...or a list of full tiles you downloaded. If you have multiple, mosaic them:
+naip_files <- list.files(here::here("data/naip_fulltiles_2023"), "\\.tif(f)?$", full.names = TRUE)
+if (length(naip_files) == 1) {
+  naip <- rast(naip_files)
+} else {
+  rlist <- lapply(naip_files, \(f) tryCatch(rast(f), error = \(e) NULL))
+  rlist <- Filter(Negate(is.null), rlist)
+  stopifnot(length(rlist) > 0)
+  naip <- do.call(mosaic, rlist)
+}
+
+#--- 1) Standardize NAIP band order to R,G,B,NIR -------------------------------
+# Planetary Computer / AWS "analytic" NAIP is typically RGBN (1..4)
+# Some sources are NRGB. We'll handle both. If unsure, set 'layout' manually.
+
+guess_layout <- function(x) {
+  if (nlyr(x) != 4) stop("Expected 4-band NAIP (RGBN). Got ", nlyr(x), " bands.")
+  # Heuristic: NIR tends to have higher mean than Blue. Compare band means.
+  m <- sapply(1:4, \(i) global(x[[i]], mean, na.rm=TRUE)[[1]])
+  nir_idx <- which.max(m)              # NIR usually has the highest mean
+  if (nir_idx == 4) return("RGBN")     # common layout
+  if (nir_idx == 1) return("NRGB")     # other common layout
+  # Fallback to RGBN (most common in PC/AWS analytic)
+  "RGBN"
+}
+
+layout <- guess_layout(naip)  # or set layout <- "RGBN" / "NRGB" explicitly
+
+idx <- switch(layout,
+  "RGBN" = list(R=1, G=2, B=3, NIR=4),
+  "NRGB" = list(NIR=1, R=2, G=3, B=4),
+  stop("Unknown layout: ", layout)
+)
+
+naip4 <- c(naip[[idx$R]], naip[[idx$G]], naip[[idx$B]], naip[[idx$NIR]])
+names(naip4) <- c("R","G","B","NIR")
+
+#--- 2) Indices (on 8-bit reflectance; coerced to float automatically) --------
+ndvi <- (naip4$NIR - naip4$R) / (naip4$NIR + naip4$R)
+ndwi <- (naip4$G   - naip4$NIR) / (naip4$G   + naip4$NIR)   # McFeeters
+savi <- 1.5 * (naip4$NIR - naip4$R) / (naip4$NIR + naip4$R + 0.5)
+
+names(ndvi) <- "NDVI"; names(ndwi) <- "NDWI"; names(savi) <- "SAVI"
+
+#--- 3) Optional texture (fast & memory-safe) ----------------------------------
+# GLCM at 30 cm on a big AOI is heavy. Use a proxy texture via focal SD on NDVI.
+# If you *really* want GLCM, downscale first (see comment below).
+w <- matrix(1, 5, 5)  # ~1.5 m window at 30 cm
+ndvi_sd <- focal(ndvi, w = w, fun = sd, na.policy = "omit", na.rm = TRUE)
+names(ndvi_sd) <- "NDVI_sd"
+
+# If you prefer true GLCM, downsample to ~2–5 m first, then compute:
+# ndvi_coarse <- aggregate(ndvi, fact = 6)                     # 0.3 m * 6 ≈ 1.8 m
+# ndvi_glcm_mean <- glcm::glcm(raster::raster(ndvi_coarse), window = c(5,5), statistics = "mean")
+# ndvi_tex_r <- rast(ndvi_glcm_mean); names(ndvi_tex_r) <- "NDVI_glcm_mean"
+
+#--- 4) Predictor stack & clip to AOI ------------------------------------------
+preds <- c(naip4, ndvi, ndwi, savi, ndvi_sd)
+preds <- mask(crop(preds, vect(aoi)), vect(aoi))   # precise clip
+
+# Quick sanity checks
+preds
+res(preds)        # should be ~0.3 0.3
+nlyr(preds)       # R,G,B,NIR + NDVI, NDWI, SAVI, NDVI_sd
+plotRGB(naip4, r=1, g=2, b=3, stretch="lin")
+plot(ndvi)        # expect vegetation bright
+
+```
+
+### 3) Classification
+
+#### Option A: Unsupervised (discover microhabitats, then name classes in field)
+
+```{r}
+set.seed(42)
+# sample pixels to fit kmeans efficiently
+samp <- spatSample(preds, size = 50000, method = "random", na.rm = TRUE, as.points = FALSE)
+X <- na.omit(as.data.frame(samp, cells=FALSE))
+
+k <- 6  # choose number of microhabitat classes you expect
+km <- kmeans(scale(X), centers = k, nstart = 10)
+
+# predict cluster for all pixels
+# terra::predict requires a model interface; do a manual classify:
+pred_mat <- as.data.frame(preds, na.rm=FALSE)
+pred_scaled <- scale(pred_mat)
+cl_idx <- rep(NA_integer_, nrow(pred_scaled))
+ok <- complete.cases(pred_scaled)
+cl_idx[ok] <- stats::predict(km, pred_scaled[ok, , drop=FALSE])  # in recent R, kmeans has predict method; otherwise use closest center
+cl_r <- preds[[1]]; values(cl_r) <- cl_idx
+names(cl_r) <- "class_id"
+
+```
+
+#### Option B: Supervised RF (if you already have training polygons)
+
+-   Prepare an **sf** layer with polygons covering representative patches; add a `class` attribute (factor).
+
+<!-- -->
+
+-   Extract training data, fit RF, predict.
+
+```{r}
+train_sf <- st_read("data/microhab_train.gpkg") %>% st_transform(crs(preds))
+train_r  <- terra::extract(preds, vect(train_sf), df = TRUE)
+train_df <- train_r %>% 
+  left_join(train_sf %>% st_drop_geometry() %>% mutate(ID=1:n()), by="ID") %>%
+  filter(!is.na(class)) %>%
+  mutate(class = factor(class))
+
+rf <- ranger(class ~ ., data = select(train_df, -ID), 
+             num.trees = 500, mtry = floor(sqrt(ncol(train_df)-2)), 
+             importance = "impurity", probability = FALSE)
+
+class_r <- predict(preds, rf, type = "response", na.rm=TRUE)
+names(class_r) <- "class_id"
+
+```
+
+### 4) Smooth & polygonize (vector polygons per class)
+
+```{r}
+# Optional: small modal filter to de-speckle (3x3)
+w <- matrix(1, 3, 3)
+class_f <- focal(class_r, w=w, fun=modal, na.policy="omit", na.rm=TRUE)
+
+# Dissolve contiguous pixels into polygons; drop tiny slivers
+polys <- as.polygons(class_f, dissolve=TRUE, values=TRUE, na.rm=TRUE)
+polys <- st_as_sf(polys) %>% st_make_valid()
+polys <- polys %>%
+  mutate(area_m2 = as.numeric(st_area(geometry))) %>%
+  filter(area_m2 >= 1000)  # keep polygons ≥ 0.1 ha (adjust)
+
+```
+
+Add human-readable class names
+
+```{r}
+lut <- tibble(class_id = 1:6,
+              class_name = c("Riparian dense","Mesquite savanna","Shrub-steppe",
+                             "Open wash","Grass-dominated","Bare/rock"))
+polys <- polys %>% left_join(lut, by="class_id")
+
+```
+
+### 5) Allocate **stratified** ground-truth points (area-proportional)
+
+#### A) Quick stratified (proportional to area) with a min per class
+
+```{r}
+# area by class
+tab <- polys %>%
+  st_drop_geometry() %>%
+  group_by(class_id) %>%
+  summarise(area_m2 = sum(area_m2), .groups="drop") %>%
+  mutate(area_prop = area_m2/sum(area_m2))
+
+N_total <- 200        # total points you want to visit
+min_per <- 10         # ensure at least this many per class
+
+tab <- tab %>%
+  mutate(n_alloc = pmax(min_per, round(N_total * area_prop))) %>%
+  mutate(n_alloc = as.integer(round(n_alloc * N_total / sum(n_alloc))))  # normalize to N_total
+
+# sample points within each class (uniform within polygons)
+set.seed(123)
+pts_list <- lapply(seq_len(nrow(tab)), function(i){
+  cid <- tab$class_id[i]
+  n_i <- tab$n_alloc[i]
+  poly_i <- polys %>% filter(class_id == cid)
+  # spatSample on polygons
+  terra::spatSample(vect(poly_i), size=n_i, method="random", as.points=TRUE) %>%
+    st_as_sf() %>%
+    mutate(class_id = cid)
+})
+gt_pts <- do.call(rbind, pts_list) %>%
+  left_join(lut, by="class_id")
+
+```
+
+#### B) GRTS (Generalized Random Tessellation Stratified) design with `spsurvey`
+
+GRTS gives excellent spatial balance within each stratum.
+
+```{r}
+# Prepare a stratum field
+polys_strata <- polys %>% mutate(stratum = as.factor(class_id))
+
+# Sample-size list by stratum (from tab)
+strata_n <- tab$n_alloc; names(strata_n) <- as.character(tab$class_id)
+
+# spsurvey expects polygons (frame) and a named vector for stratum sample sizes
+grts_out <- grts(
+  design       = strata_n,     # named int vector
+  DesignID     = "Microhabitat_GRTS",
+  type.frame   = "area",
+  src.frame    = "sf.object",
+  sf.object    = polys_strata,
+  stratumID    = "stratum",
+  mdcaty       = NULL,
+  shapefile    = FALSE
+)
+
+gt_pts_grts <- st_as_sf(grts_out$sites_legacy_areas) %>%
+  rename(class_id = stratum) %>%
+  mutate(class_id = as.integer(as.character(class_id))) %>%
+  left_join(lut, by="class_id")
+
+```
+
+### 6) Export layers for field work
+
+```{r}
+st_write(polys,        "output/microhabitat_polys.gpkg", layer="microhabitat_polys", delete_dsn=TRUE)
+writeRaster(class_f,   "output/microhabitat_class_30cm.tif", overwrite=TRUE)
+st_write(gt_pts,       "output/gt_points_stratified.gpkg", layer="gt_points", delete_dsn=TRUE)
+st_write(gt_pts_grts,  "output/gt_points_grts.gpkg",       layer="gt_points_grts", delete_dsn=TRUE)
+
+```
+
+### 7) Field labeling → accuracy assessment (post-survey)
+
+Once you collect reference labels at `gt_points*`, bring the points back, join to the classified raster, and compute a confusion matrix, user’s/producer’s accuracy, and Kappa.
+
+```{r}
+# Extract predicted class at ground-truth points
+gt <- st_read("output/gt_points_grts_with_field_labels.gpkg")  # add a 'truth' field in the field app
+pred_at_pts <- terra::extract(class_f, vect(gt))
+cmp <- gt %>% 
+  st_drop_geometry() %>%
+  bind_cols(pred_at_pts %>% select(class_id_pred = class_id)) %>%
+  mutate(truth = factor(truth),
+         pred  = factor(class_id_pred, levels = levels(truth)))  # align levels
+
+# Confusion matrix
+table(cmp$truth, cmp$pred)
+
+# Overall & per-class accuracy
+overall_acc <- mean(cmp$truth == cmp$pred, na.rm = TRUE)
+by_class <- cmp %>% group_by(truth) %>% summarise(ua = mean(truth == pred))
+overall_acc; by_class
+
+```
