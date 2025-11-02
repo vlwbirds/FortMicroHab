@@ -259,7 +259,7 @@ terra::writeRaster(class_r, here("output/classified/class_r_INT1U.tif"),
 
 #--------------- Smooth and Polygonize -----------------
 # Optional: small modal filter to de-speckle (3x3)
-terraOptions(todisk = TRUE, tempdir = "D:/terra_tmp", memfrac = 0.6)
+terraOptions(todisk = TRUE, tempdir = "C:/terra_tmp", memfrac = 0.6)
 
 out_focal <- here::here("output/classified/class_r_modal3_INT1U.tif")
 
@@ -279,12 +279,47 @@ class_f <- focal(
   overwrite = TRUE
 )
 
+# read classified raster masked 3x3
+class_f <- rast(here("output/classified/class_r_modal3_INT1U.tif"))
+
+#------ Seive out one off pixels in larger blobs to increase processing time
+# Identify contiguous patches of the same class
+cl <- terra::patches(class_f, directions = 8)
+
+# Count how many pixels are in each patch (frequency table)
+cf <- as.data.frame(terra::freq(cl))   # <- remove useNA argument
+
+# Keep only the larger clumps (≥ 9 pixels ≈ 3×3 neighborhood)
+keep <- cf$value[cf$count >= 9]
+
+# Build a TRUE/FALSE mask of "big" patches
+mask_big <- cl %in% keep
+
+# Apply the mask to your classification raster
+class_big <- terra::mask(class_f, mask_big, maskvalues = FALSE)
+
+# # Optional: write to file for inspection
+# terra::writeRaster(class_big, "output/classified/class_sieved_INT1U.tif",
+#                    datatype = "INT1U", overwrite = TRUE)
+
 
 # Dissolve contiguous pixels into polygons; drop tiny slivers
-polys <- as.polygons(class_f, dissolve=TRUE, values=TRUE, na.rm=TRUE)
-polys <- st_as_sf(polys) #(optional to ensure correct geometries) %>% st_make_valid()
-polys <- st_buffer(polys, 0)  # much faster than st_make_valid()
-polys <- polys %>%
+polys <- as.polygons(class_big, dissolve=TRUE, values=TRUE, na.rm=TRUE); names(polys) <- "class_id"
+# Simplify Edges even more
+polys_sf <- sf::st_as_sf(polys)
+polys_sf <- sf::st_simplify(polys_sf, dTolerance = terra::res(class_big)[1])  # ≈ 1 pixel# Repair Geometries with buffer (HUGE PROCESSOR TIME!!!!)
+sf::sf_use_s2(FALSE)                       # avoids s2 overhead on planar ops
+polys_sf <- sf::st_buffer(polys_sf, 0)     # fast “heal”
+# Calculate area m2
+polys_sf <- polys_sf %>%
   mutate(area_m2 = as.numeric(st_area(geometry))) %>%
   filter(area_m2 >= 1000)  # keep polygons ≥ 0.1 ha (adjust)
-plot(polys)
+# plot(polys)
+
+
+# 3️⃣ Save as a terra vector (.gpkg or .shp)
+create.dir(here("output/vector"))
+out_vec <- here("output/vector/class_polygons.gpkg")
+writeVector(polys_sf, out_vec, overwrite = TRUE)
+
+cat("✅ Saved vector polygons to:", out_vec, "\n")
