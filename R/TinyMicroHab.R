@@ -318,8 +318,7 @@ polys_sf <- polys_sf %>%
 
 
 # 3️⃣ Save as a terra vector (.gpkg or .shp)
-create.dir(here("output/vector"))
+dir.create(here("output/vector"))
 out_vec <- here("output/vector/class_polygons.gpkg")
-writeVector(polys_sf, out_vec, overwrite = TRUE)
-
+st_write(polys_sf, out_vec, driver = "GPKG", delete_dsn = TRUE, quiet = TRUE)
 cat("✅ Saved vector polygons to:", out_vec, "\n")
