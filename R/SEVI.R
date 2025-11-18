@@ -51,7 +51,7 @@ plotRGB(naip_small, 1,2,3, stretch="lin")
 # aoi : SpatVector or sf object (optional; can skip crop/mask if already clipped)
 
 # DEM 1m
-dem <- rast("data/DEM/dem_base_only.tif")
+dem <- rast("data/dem/USGS_1M_12_x56y349_AZ_CochiseCounty_2020_B20.tif")
 
 # Crop to same area as NAIP
 dem_small <- crop(dem, ext_small)
