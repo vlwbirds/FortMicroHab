@@ -28,6 +28,223 @@ library(spsurvey)
 
 ```
 
+### 0.5) Lidar Download
+
+```{r}
+# ============================================================
+# AZ_CochiseCounty_3_2020 LiDAR (EPT) → AOI clip → 1 km LAZ tiles
+# Requirements: PDAL (in a Miniconda env), R packages: sf, jsonlite, fs, here
+# ============================================================
+
+# ---- USER EDITS (adjust these) ------------------------------------------
+# 1) Where is pdal.exe? Examples:
+#    "C:/Users/<you>/miniconda3/envs/pdal/Library/bin/pdal.exe"
+#    "C:/ProgramData/miniconda3/envs/pdal/Library/bin/pdal.exe"
+pdal_exe <- "C:/Users/ForestFear/miniconda3/envs/pdal/Library/bin/pdal.exe"
+
+# 2) Your AOI shapefile (project root assumed to be this script's folder)
+aoi_shp   <- here("data/fort_aoi.shp")
+
+# 3) Output folder for 1 km LAZ tiles
+out_tiles <- here("output/tiles")
+
+# 4) Threads for EPT reader (2–6 is reasonable for home internet)
+threads   <- 4
+# -------------------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(jsonlite)
+  library(fs)
+  library(here)
+})
+
+# ---- Basic checks --------------------------------------------------------
+if (!file.exists(pdal_exe)) {
+  stop("Cannot find pdal.exe at:\n  ", pdal_exe,
+       "\n\nOpen Anaconda Prompt and run:\n",
+       "  conda create -n pdal -y\n",
+       "  conda activate pdal\n",
+       "  conda install -c conda-forge pdal -y\n",
+       "Then set 'pdal_exe' to your actual path (see 'where pdal').")
+}
+
+if (!file.exists(aoi_shp)) {
+  stop("AOI shapefile not found at: ", normalizePath(aoi_shp, winslash="/", mustWork=FALSE),
+       "\nEnsure it exists (remember a shapefile is .shp/.shx/.dbf/.prj).")
+}
+
+dir_create(out_tiles)
+
+# ---- Read AOI → make valid → reproject to EPSG:26912 --------------------
+message("Reading AOI...")
+aoi     <- st_read(aoi_shp, quiet = TRUE)
+aoi     <- st_make_valid(aoi)
+aoi_utm <- st_transform(aoi, 26912)  # NAD83 / UTM zone 12N
+
+# ---- Build WKT polygon (PDAL filters.crop likes WKT) --------------------
+geom <- st_geometry(aoi_utm)
+if (length(geom) != 1L) {
+  message("AOI has ", length(geom), " geometries; dissolving to one polygon.")
+  aoi_utm <- st_union(aoi_utm)
+  geom    <- st_geometry(aoi_utm)
+}
+wkt_poly <- st_as_text(geom[[1]])
+
+# ---- Compute 1 km tile origin aligned to 1000 m grid --------------------
+bb        <- st_bbox(aoi_utm)
+origin_x  <- floor(as.numeric(bb["xmin"]) / 1000) * 1000
+origin_y  <- floor(as.numeric(bb["ymin"]) / 1000) * 1000
+
+# ---- Normalize paths for JSON/Windows -----------------------------------
+pipe_file       <- here("pipeline_cochise_1km.json") |> normalizePath(winslash="/", mustWork=FALSE)
+out_tiles_abs   <- normalizePath(out_tiles, winslash="/", mustWork=TRUE)
+
+# ---- Build PDAL pipeline JSON -------------------------------------------
+pipeline <- list(
+  list(
+    type     = "readers.ept",
+    filename = "https://s3-us-west-2.amazonaws.com/usgs-lidar-public/AZ_CochiseCounty_3_2020/ept.json",
+    threads  = threads,
+    bounds   = "auto"
+  ),
+  list(
+    type    = "filters.crop",
+    polygon = wkt_poly        # <-- WKT avoids any FILE:/path quirks
+  ),
+  list(
+    type     = "filters.splitter",
+    length   = 1000.0,        # 1 km tiles
+    buffer   = 0.0,           # set to 10.0 for 10 m overlap
+    origin_x = origin_x,
+    origin_y = origin_y
+  ),
+  list(
+    type       = "writers.las",
+    filename   = file.path(out_tiles_abs, "tile_#.laz"),
+    compression= "laszip",
+    forward    = "all"
+  )
+)
+
+writeLines(prettify(toJSON(pipeline, auto_unbox = TRUE)), pipe_file)
+message("Wrote pipeline JSON: ", pipe_file)
+
+# ---- Run PDAL pipeline ---------------------------------------------------
+cmd_args <- c("pipeline", pipe_file, "--verbose=6")
+message("Running PDAL: ", pdal_exe, " ", paste(cmd_args, collapse=" "))
+out <- system2(pdal_exe, cmd_args, stdout = TRUE, stderr = TRUE)
+
+# Echo PDAL output (useful if there’s an error)
+cat(paste(out, collapse="\n"), "\n")
+
+status <- attr(out, "status")
+if (!is.null(status) && status != 0) {
+  stop("PDAL pipeline failed (status ", status, "). See log above for details.")
+}
+
+# ---- Summarize outputs ---------------------------------------------------
+tiles <- dir_ls(out_tiles, glob = "*.laz")
+if (length(tiles) == 0) {
+  warning("No tiles were written. Check PDAL log above.\n",
+          "- If you see 'polygon must be same SRS as points', ensure AOI was reprojected to EPSG:26912.\n",
+          "- If 'Unable to fetch EPT info', check network/firewall and the EPT URL.")
+} else {
+  sizes_mb <- round(file_info(tiles)$size / 1e6, 1)
+  summary  <- data.frame(tile = path_file(tiles), size_MB = sizes_mb)
+  print(summary)
+  message("Wrote ", length(tiles), " tiles to ", out_tiles_abs)
+}
+
+# -------------------- OPTIONAL NEXT STEPS --------------------------------
+# To grid each tile into DTM/DSM/CHM with PDAL or R (lidR), you can loop over
+# the written LAZ files. Example PDAL single-tile DTM at 1 m:
+#
+#   dtm_pipe <- list(
+#     "output/tiles/tile_1.laz",
+#     list(type="filters.smrf", scalar=1.2, slope=0.2, threshold=0.45, window=16),
+#     list(type="filters.hag"),
+#     list(type="writers.gdal", filename="output/rasters/tile_1_dtm_1m.tif",
+#          resolution=1.0, radius=1.5, output_type="min", gdaldriver="GTiff")
+#   )
+#   # write & run similar to above
+#
+# Or use lidR in R to rasterize canopy height, etc.
+
+```
+
+```{r}
+library(jsonlite); library(sf); library(fs); library(here)
+
+# --- configure these if your paths differ ---
+miniconda_root <- "C:/Users/ForestFear/miniconda3"   # adjust if installed elsewhere
+env_name       <- "pdal"                             # conda env you created
+# --------------------------------------------
+
+# Try to locate conda and pdal
+conda_bat <- file.path(miniconda_root, "condabin", "conda.bat")
+pdal_exe  <- file.path(miniconda_root, "envs", env_name, "Library", "bin", "pdal.exe")
+
+if (!file.exists(conda_bat)) stop("Can't find conda.bat at: ", conda_bat,
+  "\nIf Miniconda lives elsewhere, set miniconda_root accordingly.")
+if (!file.exists(pdal_exe)) {
+  message("PDAL not found in env '", env_name, "'. Install it once via Anaconda Prompt:\n",
+          "  conda create -n ", env_name, " -y\n",
+          "  conda activate ", env_name, "\n",
+          "  conda install -c conda-forge pdal -y")
+  stop("Install PDAL, then re-run.")
+}
+
+# Quick version checks
+system2(conda_bat, c("--version"), stdout = TRUE)
+system2(pdal_exe,  c("--version"), stdout = TRUE)
+
+# ---- your existing AOI → GeoJSON (EPSG:26912) ----
+aoi_shp   <- here("data","fort_aoi.shp")
+out_tiles <- here("output","tiles")
+dir_create(out_tiles)
+
+aoi      <- st_read(aoi_shp, quiet = TRUE)
+aoi_utm  <- st_transform(st_make_valid(aoi), 26912)
+aoi_gj_abs   <- normalizePath(here("data","fort_aoi_26912.geojson"),
+                          winslash="/", mustWork=FALSE)
+st_write(aoi_utm, aoi_gj, driver="GeoJSON", delete_dsn=TRUE, quiet=TRUE)
+
+bb        <- st_bbox(aoi_utm)
+origin_x  <- floor(bb["xmin"]/1000)*1000
+origin_y  <- floor(bb["ymin"]/1000)*1000
+out_tiles_abs <- normalizePath(out_tiles, winslash="/", mustWork=TRUE)
+
+polygon_path <- aoi_gj_abs  # absolute path with forward slashes is fine
+pipeline <- list(
+  list(type="readers.ept",
+       filename="https://s3-us-west-2.amazonaws.com/usgs-lidar-public/AZ_CochiseCounty_3_2020/ept.json",
+       threads=4, bounds="auto"),
+  list(type="filters.crop", polygon=polygon_path),
+  list(type="filters.splitter", length=1000.0, buffer=0.0,
+       origin_x=origin_x, origin_y=origin_y),
+  list(type="writers.las",
+       filename=file.path(out_tiles_abs, "tile_#.laz"),
+       compression="laszip", forward="all")
+)
+
+# Re-write and run (also change verbose flag form)
+writeLines(jsonlite::prettify(jsonlite::toJSON(pipeline, auto_unbox=TRUE)), pipe_file)
+
+status <- system2(pdal_exe, c("pipeline",
+                              normalizePath(pipe_file, winslash="/"),
+                              "--verbose=6"),                 # <-- note =6
+                  stdout=TRUE, stderr=TRUE)
+cat(paste(status, collapse="\n"))
+
+
+if (!is.null(attr(status, "status")) && attr(status,"status") != 0)
+  stop("PDAL pipeline failed. See output above.")
+
+dir_ls(out_tiles, glob="*.laz")
+
+```
+
 ### 1) Imagery Download
 
 #### A) Sentinel2 Data
@@ -71,7 +288,7 @@ library(purrr)
 library(curl)
 
 # --- Inputs ---------------------------------------------------------------
-aoi     <- st_read(here::here("data/FH_Boundary.shp")) |> st_transform(4326)
+aoi     <- st_read(here::here("data/fort_aoi_2.shp")) |> st_transform(4326)
 aoi_buf <- st_buffer(aoi, dist = 500)                      # include edge tiles
 bb      <- st_bbox(aoi_buf)
 outdir  <- here::here("data/naip_tiles_2023")
@@ -471,5 +688,126 @@ table(cmp$truth, cmp$pred)
 overall_acc <- mean(cmp$truth == cmp$pred, na.rm = TRUE)
 by_class <- cmp %>% group_by(truth) %>% summarise(ua = mean(truth == pred))
 overall_acc; by_class
+
+```
+
+### XX) Troubleshooting
+
+```{r}
+# Show whether conda and PDAL are reachable from R
+system2("conda", c("--version"), stdout = TRUE, stderr = TRUE)
+system2("conda", c("run","-n","pdal","pdal","--version"), stdout = TRUE, stderr = TRUE)
+
+```
+
+```{r}
+system2("conda", "--version", stdout=TRUE)
+system2("pdal", "--version", stdout=TRUE)
+
+```
+
+```{r}
+logfile <- normalizePath("pdal_run.log", winslash = "/", mustWork = FALSE)
+cmd_args <- c("pipeline", pipe_file, "--verbose=7")
+
+out <- system2(pdal_exe, cmd_args, stdout = TRUE, stderr = TRUE)
+writeLines(out, logfile)
+
+# Print the last 60 lines to console
+tail_lines <- tail(out, 60)
+cat(paste(tail_lines, collapse = "\n"), "\n")
+
+status <- attr(out, "status")
+if (!is.null(status) && status != 0) {
+  stop("PDAL failed (status ", status, "). Full log in: ", logfile)
+}
+
+```
+
+```{r}
+# ========= AZ_CochiseCounty_3_2020 → AOI crop → 1 km LAZ (PDAL via R) =========
+suppressPackageStartupMessages({
+  library(sf); library(jsonlite); library(fs); library(here)
+})
+
+# --- EDIT ME ---
+pdal_exe <- "C:/Users/ForestFear/miniconda3/envs/pdal/Library/bin/pdal.exe"
+aoi_shp  <- here("data/fort_aoi.shp")
+out_tiles <- "output/tiles"
+threads <- 4
+# --------------
+
+stopifnot(file.exists(pdal_exe))
+stopifnot(file.exists(aoi_shp))
+dir_create(out_tiles)
+
+# 1) AOI → valid → EPSG:26912
+aoi <- st_read(aoi_shp, quiet = TRUE)
+aoi <- st_make_valid(aoi)
+aoi_utm <- st_transform(aoi, 26912)
+
+# dissolve to single polygon if needed
+if (length(st_geometry(aoi_utm)) > 1L) aoi_utm <- st_union(aoi_utm)
+
+# 2) Build INLINE GEOJSON geometry string (NOT WKT, NOT FILE:)
+coords <- st_coordinates(st_cast(aoi_utm, "POLYGON"))[, c("X","Y")]
+# Ensure ring closed
+if (!all(coords[1,] == coords[nrow(coords),])) coords <- rbind(coords, coords[1,])
+# Convert to nested list [[ [x,y], [x,y], ... ]]
+ring <- unname(split(coords, seq_len(nrow(coords))))
+ring <- lapply(ring, function(r) unname(as.numeric(r)))
+geom_list <- list(type = "Polygon", coordinates = list(ring))
+polygon_geojson_str <- toJSON(geom_list, auto_unbox = TRUE)
+
+# 3) 1 km grid origin
+bb <- st_bbox(aoi_utm)
+origin_x <- floor(as.numeric(bb["xmin"])/1000)*1000
+origin_y <- floor(as.numeric(bb["ymin"])/1000)*1000
+
+# 4) Build pipeline JSON (use inline GeoJSON for 'polygon')
+out_tiles_abs <- normalizePath(out_tiles, winslash = "/", mustWork = TRUE)
+pipe_file <- normalizePath(here("pipeline_cochise_1km.json"), winslash = "/", mustWork = FALSE)
+
+pipeline <- list(
+  list(
+    type     = "readers.ept",
+    filename = "https://s3-us-west-2.amazonaws.com/usgs-lidar-public/AZ_CochiseCounty_3_2020/ept.json",
+    threads  = threads,
+    bounds   = "auto"
+  ),
+  list(
+    type    = "filters.crop",
+    polygon = as.character(polygon_geojson_str)   # <— JSON string starting with '{'
+  ),
+  list(
+    type     = "filters.splitter",
+    length   = 1000.0,
+    buffer   = 0.0,
+    origin_x = origin_x,
+    origin_y = origin_y
+  ),
+  list(
+    type        = "writers.las",
+    filename    = file.path(out_tiles_abs, "tile_#.laz"),
+    compression = "laszip",
+    forward     = "all"
+  )
+)
+
+writeLines(prettify(toJSON(pipeline, auto_unbox = TRUE)), pipe_file)
+cat("Pipeline JSON:", pipe_file, "\n")
+
+# 5) Run PDAL (verbose) and show tail of log
+log_out <- system2(pdal_exe,
+                   c("pipeline", pipe_file, "--verbose=6"),
+                   stdout = TRUE, stderr = TRUE)
+cat(paste(tail(log_out, 60), collapse = "\n"), "\n")
+
+status <- attr(log_out, "status")
+if (!is.null(status) && status != 0) stop("PDAL pipeline failed (status ", status, ").")
+
+# 6) List results
+tiles <- dir_ls(out_tiles, glob = "*.laz")
+cat("Wrote", length(tiles), "tiles to", out_tiles_abs, "\n")
 
 ```
